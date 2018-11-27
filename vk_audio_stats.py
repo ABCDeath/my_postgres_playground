@@ -1,6 +1,18 @@
+# encoding: utf-8
+"""
+Скрипт логинится в вконтакте и обычными запросами с мобильной версии сайта
+достаёт список исполнителей из аудиозаписей пользователей, так как в открытом
+api больше нет возможности работать с аудиозаписями.
+Далее для каждого исполнителя, если его ещё нет в базе данных, находится через
+api ресурса с информацией о треках и исполнителях musicbrainz
+или простым запросом в гугле (если находится) музыкальное направление.
+Исполнители и жанры добавляются в локальную бд postgresql.
+После этого можно посмотреть различную информацию о музыкальных предпочтениях
+уже добавленных в базу пользователей.
+"""
+
 import argparse
 import datetime
-import discogs_client
 import json
 import pickle
 import psycopg2
@@ -15,17 +27,16 @@ def wait_request_timing(prev_time, rate):
         time.sleep(1 / rate - (time.time() - prev_time))
 
 
-class VkAudioGetter(object):
+class VkAudioGetter:
     def __init__(self, credentials):
         self._query_prev_time = 0
+        self._session = requests.Session()
+
         try:
             with open('session', 'rb') as storage:
-                cookies = pickle.load(storage)
-                self._session = requests.Session()
-                self._session.cookies.update(cookies)
+                self._session.cookies.update(pickle.load(storage))
         except FileNotFoundError:
             # получаем страничку логина, если куки не нашлись
-            self._session = requests.Session()
             self._session.headers.update({
                 'User-agent': 'Mozilla/5.0 (Windows NT 6.1; rv:52.0) '
                               'Gecko/20100101 Firefox/52.0'
@@ -50,15 +61,15 @@ class VkAudioGetter(object):
                 pickle.dump(self._session.cookies, storage)
 
     def user_audio_list(self, user_id):
-        url = ''.join(['https://m.vk.com/audios', user_id])
-        _QUERY_RATE = 0.5
+        url = f'https://m.vk.com/audios{user_id}'
+        _query_rate = 0.5
         self._query_prev_time = 0
 
         artists = []
         offset = 0
         last_audio = None
         while True:
-            wait_request_timing(self._query_prev_time, _QUERY_RATE)
+            wait_request_timing(self._query_prev_time, _query_rate)
 
             resp = self._session.get(url, params={'offset': offset},
                                      allow_redirects=False)
@@ -75,18 +86,15 @@ class VkAudioGetter(object):
             # которая ожидалась, даже если offset будет постоянным
             # (например, 50) или равен количеству ранее выданных аудиозаписей,
             # поэтому запоминаем, на чем остановились.
-            container_start = 0
-            if last_audio is not None:
-                for num, item in enumerate(
-                        container[0].find_all('span', 'ai_title')):
-                    if item.string == last_audio:
-                        container_start = num + 1
-                        break
+            container_start = (
+                container[0].find_all('span', 'ai_title').index(last_audio)
+                if last_audio else 0
+            )
 
-            last_audio = container[0].find_all('span', 'ai_title')[-1].string
+            last_audio = container[0].find_all('span', 'ai_title')[-1]
             content = container[0].find_all('span', 'ai_artist')
 
-            artists.extend([a.string for a in content[container_start:]])
+            artists += [a.string for a in content[container_start:]]
 
             offset += len(content)
 
@@ -98,7 +106,7 @@ class AudioDB(object):
             database='music')
 
         # в бд таблицы жанров, поджанров, исполнителей, пользователей и
-        # таблица с исполнителями у пользователей, в которой есть количество
+        # таблица исполнителей к пользователям, в которой есть количество
         # треков исполнителя
 
         query = (
@@ -186,8 +194,7 @@ class AudioDB(object):
                 )
             """
         cursor.execute(query, (user_id,))
-        irrelevant = list(set([x[0] for x in cursor.fetchall()]).difference(
-            set([x for x in artists])))
+        irrelevant = list(set([x[0] for x in cursor.fetchall()]) - set(artists))
 
         if irrelevant:
             # вместо JOIN в DELETE используется USING
@@ -243,7 +250,7 @@ class AudioDB(object):
         self._add_subgenre(subgenre)
 
     def add_artist(self, name, genre, subgenre):
-        if genre is None:
+        if not genre:
             subgenre = None
 
         # TODO: для genre вместо None -- unknown, для sub -- ''
@@ -409,12 +416,12 @@ class AudioDB(object):
         return resp
 
 class GenreSearcher(object):
-    _USER_AGENT = {
+    _user_agent = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                       'AppleWebKit/537.36 (KHTML, like Gecko) '
                       'Chrome/61.0.3163.100 Safari/537.36'
     }
-    _QUERY_RATE = 1  # per second
+    _query_rate = 1  # per second
 
     def __init__(self, musicbrainz_credentials):
         self._google_query_prev_time = 0
@@ -427,24 +434,14 @@ class GenreSearcher(object):
     def _encode(self, string):
         return string.replace('#', '%23').replace(' ', r'%20')
 
-    def _discogs(self, artist_name):
-        client = discogs_client.Client(
-            'MyGetArtistGenreApp/0.1',
-            user_token='bgXSArBadKChVYdHHRnfylRtPmXLZfUDZyRQKjzB')
-        res = client.search(artist_name, type='artist')
-        # нет жанров/тегов/стилей у исполнителя, только по релизам
-        pass
-
     def _google(self, artist_name):
         # TODO: попробовать вместо гугла какой-нибудь duckduckgo
-        query = artist_name + ' genre'
+        query = ''.join([artist_name, ' genre']).replace(' ', '+')
 
-        wait_request_timing(self._google_query_prev_time, self._QUERY_RATE)
+        wait_request_timing(self._google_query_prev_time, self._query_rate)
 
-        escaped_query = query.replace(' ', '+')
-        url = 'https://www.google.com/search?q={}&num={}&hl={}'.format(
-            escaped_query, 1, 'en')
-        response = requests.get(url, headers=self._USER_AGENT)
+        url = f'https://www.google.com/search?q={query}&num=1&hl=en'
+        response = requests.get(url, headers=self._user_agent)
 
         self._google_query_prev_time = time.time()
 
@@ -467,27 +464,27 @@ class GenreSearcher(object):
 
     def _musicbrainz(self, artist_name):
         # TODO: запрашивать сразу список, из него выбирать
-        url = 'https://musicbrainz.org/ws/2/artist/' \
-              '?query=artist:{}&inc=tags&fmt=json'.format(
-            self._encode(artist_name))
+        url = f'https://musicbrainz.org/ws/2/artist/' \
+              f'?query=artist:{self._encode(artist_name)}&inc=tags&fmt=json'
 
-        wait_request_timing(self._musicbrainz_query_prev_time, self._QUERY_RATE)
+        wait_request_timing(self._musicbrainz_query_prev_time, self._query_rate)
 
-        resp = requests.get(url, headers=self._USER_AGENT)
+        resp = requests.get(url, headers=self._user_agent)
 
         self._musicbrainz_query_prev_time = time.time()
 
         for artist in resp.json()['artists']:
-            if artist['name'].lower() == artist_name.lower():
-                if 'tags' not in artist:
-                    return None
+            if (artist['name'].lower() != artist_name.lower() or
+                    'tags' not in artist):
+                return None
 
-                tag_name = sorted(artist['tags'], key=lambda tag: tag['count'],
-                                  reverse=True)[0]['name']
-                tags = tag_name.split(' ')[::-1]
-                return tags[0], (tags[1] if len(tags) > 1 else None)
-        else:
-            return None
+            tag_name = sorted(artist['tags'], key=lambda tag: tag['count'],
+                              reverse=True)[0]['name']
+            tags = tag_name.split(' ')[::-1]
+
+            return tags[0], (tags[1] if len(tags) > 1 else None)
+
+        return None
 
     def search(self, artist_name):
         res = self._musicbrainz(artist_name)
@@ -509,32 +506,37 @@ if __name__ == '__main__':
     argparser.add_argument('ids', type=str, nargs='+')
     users_id = argparser.parse_args()
 
-    with open('credentials.json', 'r') as cred_file:
+    with open('credentials.json') as cred_file:
         credentials = json.load(cred_file)
 
     db = AudioDB(credentials['postgres']['user'],
                  credentials['postgres']['password'])
+
     search = GenreSearcher(credentials['musicbrainz'])
+
     api = vk_requests.create_api(service_token=credentials['vk']['token'])
+
     vk_audio_get = VkAudioGetter(credentials['vk'])
+
     del credentials
 
-    print('+{}: получение аудиозаписей.'.format(time_diff(start_time)))
+    print(f'+{time_diff(start_time)}: получение аудиозаписей.')
 
     for user_id in users_id.ids:
         user_info = api.users.get(user_ids=int(user_id), lang=0)[0]
+
         db.add_user(user_id, ' '.join(
             [user_info['first_name'], user_info['last_name']]))
 
-        print('+{}: пользователь {} {}, id: {}'.format(
-            time_diff(start_time), user_info['first_name'],
-            user_info['last_name'], user_id))
+        print(f'+{time_diff(start_time)}: '
+              f'пользователь {user_info["first_name"]} '
+              f'{user_info["last_name"]}, id: {user_id}')
 
         # get audio list
         artists = vk_audio_get.user_audio_list(user_id)
 
-        print('+{}: {} аудиозаписей, поиск и добавление тегов в бд'.format(
-            time_diff(start_time), len(artists)))
+        print(f'+{time_diff(start_time)}: {len(artists)} аудиозаписей, '
+              f'поиск и добавление тегов в бд')
 
         for artist in artists:
             if db.is_artist_exists(artist):
@@ -543,17 +545,15 @@ if __name__ == '__main__':
             genre, subgenre = search.search(artist)
             db.add_artist(artist, genre, subgenre)
 
-        print('+{}: добавление исполнителей к пользователям'.format(
-            time_diff(start_time)))
+        print(f'+{time_diff(start_time)}: добавление исполнителей')
 
         db.update_user_artists(user_id, artists)
 
     for user_id in users_id.ids:
-        print('+{}: {}:'.format(time_diff(start_time), user_id),
+        print(f'+{time_diff(start_time)}: {user_id}:',
               db.get_user_artists(user_id, 5))
-        print('+{}: {}:'.format(time_diff(start_time), user_id),
+        print(f'+{time_diff(start_time)}: {user_id}:',
               db.get_user_genres(user_id, True, 5))
 
-    print('+{}: {} - {}: {}'.format(
-        time_diff(start_time), users_id.ids[0], users_id.ids[1],
-        db.users_genre_intersection(users_id.ids[0], users_id.ids[1], 5)))
+    print(f'+{time_diff(start_time)}: {users_id.ids[0]} - {users_id.ids[1]}:',
+        db.users_genre_intersection(users_id.ids[0], users_id.ids[1], 5))
