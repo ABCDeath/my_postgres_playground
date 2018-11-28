@@ -11,14 +11,19 @@ api ресурса с информацией о треках и исполнит
 уже добавленных в базу пользователей.
 """
 
+import asyncio
 import argparse
+import collections
 import datetime
 import json
+import logging
 import pickle
-import psycopg2
 import requests
-import vk_requests
 import time
+
+import aiohttp
+import psycopg2
+import vk_requests
 from bs4 import BeautifulSoup
 
 
@@ -28,59 +33,76 @@ def wait_request_timing(prev_time, rate):
 
 
 class VkAudioGetter:
-    def __init__(self, credentials):
-        self._query_prev_time = 0
-        self._session = requests.Session()
+    _headers = {
+        'User-agent': 'Mozilla/5.0 (Windows NT 6.1; rv:52.0) '
+                      'Gecko/20100101 Firefox/52.0'
+    }
+
+    # TODO: как реализованы методы __enter__ и __exit__ для async/awit?
+
+    async def open(self, credentials):
+        self._session = aiohttp.ClientSession(headers=self._headers,
+                                              raise_for_status=True)
 
         try:
-            with open('session', 'rb') as storage:
-                self._session.cookies.update(pickle.load(storage))
+            self._session.cookie_jar.load('session')
+
+            logging.info('куки загружены')
+
+            return
         except FileNotFoundError:
-            # получаем страничку логина, если куки не нашлись
-            self._session.headers.update({
-                'User-agent': 'Mozilla/5.0 (Windows NT 6.1; rv:52.0) '
-                              'Gecko/20100101 Firefox/52.0'
-            })
+            pass
 
-            resp = self._session.get('https://vk.com')
-            resp_soup = BeautifulSoup(resp.text, 'lxml')
-            answer = {
-                '_origin': 'https://vk.com',
-                'act': 'login',
-                'email': credentials['login'],
-                'pass': credentials['password'],
-                'ip_h': resp_soup('input', {'name': 'ip_h'})[0]['value'],
-                'lg_h': resp_soup('input', {'name': 'lg_h'})[0]['value'],
-                'role': 'al_frame'
-            }
+        logging.info('не удалось открыть файл с куками, логинимся заново')
 
-            # логинимся, ip_h и lg_h, похоже, csrf-токен
-            self._session.post('https://login.vk.com', answer)
-            # TODO: check status
-            with open('session', 'wb') as storage:
-                pickle.dump(self._session.cookies, storage)
+        # получаем страничку логина, если куки не нашлись
+        async with self._session.get('https://vk.com') as r:
+            resp = await r.text()
 
-    def user_audio_list(self, user_id):
+        resp_soup = BeautifulSoup(resp, 'lxml')
+
+        answer = {
+            '_origin': 'https://vk.com',
+            'act': 'login',
+            'email': credentials['login'],
+            'pass': credentials['password'],
+            'ip_h': resp_soup('input', {'name': 'ip_h'})[0]['value'],
+            'lg_h': resp_soup('input', {'name': 'lg_h'})[0]['value'],
+            'role': 'al_frame'
+        }
+
+        # логинимся, ip_h и lg_h, похоже, csrf-токен
+        async with self._session.post('https://login.vk.com', data=answer) as r:
+            await r.text()
+
+        logging.info('залогинились')
+
+        self._session.cookie_jar.save('session')
+
+    async def close(self):
+        await self._session.close()
+
+    async def get_audio_list(self, user_id, queue, finish):
         url = f'https://m.vk.com/audios{user_id}'
-        _query_rate = 0.5
-        self._query_prev_time = 0
+        query_rate = 0.5
 
-        artists = []
         offset = 0
         last_audio = None
+
         while True:
-            wait_request_timing(self._query_prev_time, _query_rate)
+            logging.info('получаем аудиозаписи id: %s', user_id)
 
-            resp = self._session.get(url, params={'offset': offset},
-                                     allow_redirects=False)
-            resp.raise_for_status()
+            async with self._session.get(
+                    url, params={'offset': offset}, allow_redirects=False) as r:
+                print('status:', r.status)
+                resp = await r.text()
 
-            audio_soup = BeautifulSoup(resp.text, 'lxml')
+            audio_soup = BeautifulSoup(resp, 'lxml')
             container = audio_soup(
                 'div', class_='audios_block audios_list _si_container')
 
             if not container:
-                return artists
+                break
 
             # следующий запрос возвращает не ту аудиозапись,
             # которая ожидалась, даже если offset будет постоянным
@@ -94,12 +116,21 @@ class VkAudioGetter:
             last_audio = container[0].find_all('span', 'ai_title')[-1]
             content = container[0].find_all('span', 'ai_artist')
 
-            artists += [a.string for a in content[container_start:]]
+            queue.put_nowait([a.string for a in content[container_start:]])
 
             offset += len(content)
 
+            logging.info('ждём %s секунд', query_rate)
 
-class AudioDB(object):
+            await asyncio.sleep(query_rate)
+
+        logging.info('закончили получать список аудио')
+
+        finish.set()
+        queue.put_nowait(None)
+
+
+class AudioDB:
     def __init__(self, user, password):
         self._db_conn = psycopg2.connect(
             host='localhost', port='5432', user=user, password=password,
@@ -352,7 +383,8 @@ class AudioDB(object):
             query = """
                 SELECT genre.name, sum FROM genre
                 INNER JOIN (
-                    SELECT artist.genre_id AS gid, SUM(tracks_num) AS sum FROM user_to_artist u2a
+                    SELECT artist.genre_id AS gid, SUM(tracks_num) AS sum
+                    FROM user_to_artist u2a
                     INNER JOIN artist ON artist.id = u2a.artist_id
                     WHERE EXISTS (
                         SELECT 1 FROM vk_user u
@@ -415,7 +447,8 @@ class AudioDB(object):
 
         return resp
 
-class GenreSearcher(object):
+
+class GenreSearcher:
     _user_agent = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                       'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -499,12 +532,53 @@ def time_diff(start_time):
     return str(datetime.datetime.now() - start_time)
 
 
+async def get_audio(vk_id, queue, finish, credentials):
+    vk_audio_getter = VkAudioGetter()
+    await vk_audio_getter.open(credentials)
+
+    for id in vk_id:
+        await vk_audio_getter.get_audio_list(id, queue, finish)
+
+    await vk_audio_getter.close()
+
+
+async def dummy(q, event):
+    while not q.empty() or not event.is_set():
+        print(await q.get())
+        q.task_done()
+
+    logging.info('обработали все аудио')
+
+
+def run_tasks(vk_id, credentials):
+    loop = asyncio.get_event_loop()
+    vk_audio_queue = asyncio.Queue()
+    vk_audio_event = asyncio.Event()
+
+    tasks = [
+        loop.create_task(get_audio(vk_id, vk_audio_queue, vk_audio_event,
+                                   credentials['vk'])),
+        loop.create_task(dummy(vk_audio_queue, vk_audio_event))
+    ]
+
+    del credentials
+
+    loop.run_until_complete(asyncio.wait(tasks))
+    loop.close()
+
+
 if __name__ == '__main__':
     start_time = datetime.datetime.now()
 
     argparser = argparse.ArgumentParser()
     argparser.add_argument('ids', type=str, nargs='+')
-    users_id = argparser.parse_args()
+    argparser.add_argument('-v', '--verbose', action='store_true')
+
+    args = argparser.parse_args()
+    
+    logging.basicConfig(
+        format='+%(relativeCreated)d - %(funcName)s: %(levelname)s: %(message)s',
+        level=logging.INFO if args.verbose else logging.DEBUG)
 
     with open('credentials.json') as cred_file:
         credentials = json.load(cred_file)
@@ -522,7 +596,7 @@ if __name__ == '__main__':
 
     print(f'+{time_diff(start_time)}: получение аудиозаписей.')
 
-    for user_id in users_id.ids:
+    for user_id in args.ids:
         user_info = api.users.get(user_ids=int(user_id), lang=0)[0]
 
         db.add_user(user_id, ' '.join(
@@ -533,7 +607,7 @@ if __name__ == '__main__':
               f'{user_info["last_name"]}, id: {user_id}')
 
         # get audio list
-        artists = vk_audio_get.user_audio_list(user_id)
+        artists = vk_audio_get.get_audio_list(user_id)
 
         print(f'+{time_diff(start_time)}: {len(artists)} аудиозаписей, '
               f'поиск и добавление тегов в бд')
@@ -549,11 +623,11 @@ if __name__ == '__main__':
 
         db.update_user_artists(user_id, artists)
 
-    for user_id in users_id.ids:
+    for user_id in args.ids:
         print(f'+{time_diff(start_time)}: {user_id}:',
               db.get_user_artists(user_id, 5))
         print(f'+{time_diff(start_time)}: {user_id}:',
               db.get_user_genres(user_id, True, 5))
 
-    print(f'+{time_diff(start_time)}: {users_id.ids[0]} - {users_id.ids[1]}:',
-        db.users_genre_intersection(users_id.ids[0], users_id.ids[1], 5))
+    print(f'+{time_diff(start_time)}: {args.ids[0]} - {args.ids[1]}:',
+          db.users_genre_intersection(args.ids[0], args.ids[1], 5))
