@@ -90,11 +90,12 @@ class VkAudioGetter:
         last_audio = None
 
         while True:
-            logging.info('получаем аудиозаписи id: %s', user_id)
+            logging.info('получаем аудиозаписи id: %s, offset: %s',
+                         user_id, offset)
 
             async with self._session.get(
                     url, params={'offset': offset}, allow_redirects=False) as r:
-                print('status:', r.status)
+                logging.info('status: %s', r.status)
                 resp = await r.text()
 
             audio_soup = BeautifulSoup(resp, 'lxml')
@@ -104,16 +105,16 @@ class VkAudioGetter:
             if not container:
                 break
 
+            titles = container[0].find_all('span', 'ai_title')
+
             # следующий запрос возвращает не ту аудиозапись,
             # которая ожидалась, даже если offset будет постоянным
             # (например, 50) или равен количеству ранее выданных аудиозаписей,
             # поэтому запоминаем, на чем остановились.
-            container_start = (
-                container[0].find_all('span', 'ai_title').index(last_audio)
-                if last_audio else 0
-            )
+            container_start = (titles.index(last_audio)
+                if last_audio and last_audio in titles else 0)
 
-            last_audio = container[0].find_all('span', 'ai_title')[-1]
+            last_audio = titles[-1]
             content = container[0].find_all('span', 'ai_artist')
 
             queue.put_nowait([a.string for a in content[container_start:]])
@@ -555,15 +556,10 @@ def run_tasks(vk_id, credentials):
     vk_audio_queue = asyncio.Queue()
     vk_audio_event = asyncio.Event()
 
-    tasks = [
-        loop.create_task(get_audio(vk_id, vk_audio_queue, vk_audio_event,
-                                   credentials['vk'])),
-        loop.create_task(dummy(vk_audio_queue, vk_audio_event))
-    ]
-
-    del credentials
-
-    loop.run_until_complete(asyncio.wait(tasks))
+    loop.run_until_complete(asyncio.gather(
+            get_audio(vk_id, vk_audio_queue, vk_audio_event, credentials['vk']),
+            dummy(vk_audio_queue, vk_audio_event)
+        ))
     loop.close()
 
 
@@ -575,13 +571,17 @@ if __name__ == '__main__':
     argparser.add_argument('-v', '--verbose', action='store_true')
 
     args = argparser.parse_args()
-    
+
     logging.basicConfig(
         format='+%(relativeCreated)d - %(funcName)s: %(levelname)s: %(message)s',
         level=logging.INFO if args.verbose else logging.DEBUG)
 
+    logging.info('список аудиозаписей для id: %s', args.ids)
+
     with open('credentials.json') as cred_file:
         credentials = json.load(cred_file)
+
+    run_tasks(args.ids, credentials)
 
     db = AudioDB(credentials['postgres']['user'],
                  credentials['postgres']['password'])
