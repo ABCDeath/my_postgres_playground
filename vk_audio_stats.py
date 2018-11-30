@@ -13,11 +13,9 @@ api ресурса с информацией о треках и исполнит
 
 import asyncio
 import argparse
-import collections
 import datetime
 import json
 import logging
-import pickle
 import requests
 import time
 
@@ -25,6 +23,7 @@ import aiohttp
 import psycopg2
 import vk_requests
 from bs4 import BeautifulSoup
+from psycopg2.extras import execute_batch
 
 
 def wait_request_timing(prev_time, rate):
@@ -112,12 +111,13 @@ class VkAudioGetter:
             # (например, 50) или равен количеству ранее выданных аудиозаписей,
             # поэтому запоминаем, на чем остановились.
             container_start = (titles.index(last_audio)
-                if last_audio and last_audio in titles else 0)
+                               if last_audio and last_audio in titles else 0)
 
             last_audio = titles[-1]
             content = container[0].find_all('span', 'ai_artist')
 
-            queue.put_nowait([a.string for a in content[container_start:]])
+            queue.put_nowait(
+                [a.string.lower() for a in content[container_start:]])
 
             offset += len(content)
 
@@ -154,12 +154,13 @@ class AudioDB:
                 name VARCHAR(64) NOT NULL UNIQUE
             )
             """,
+
             """
             CREATE TABLE IF NOT EXISTS artist (
                 id serial PRIMARY KEY,
                 name VARCHAR(128) NOT NULL UNIQUE DEFAULT 'unknown',
-                genre_id INT NOT NULL REFERENCES genre (id),
-                subgenre_id INT NOT NULL REFERENCES subgenre (id)
+                genre_id INT REFERENCES genre (id),
+                subgenre_id INT REFERENCES subgenre (id)
             )
             """,
             """
@@ -185,107 +186,94 @@ class AudioDB:
         self._db_conn.commit()
 
     def _add_genre(self, genre):
+        query = 'INSERT INTO genre (name) VALUES (%s) ON CONFLICT DO NOTHING'
+
         with self._db_conn.cursor() as cursor:
-            cursor.execute(
-                'INSERT INTO genre (name) VALUES (%s) ON CONFLICT DO NOTHING',
-                (genre if genre else 'None',))
+            execute_batch(cursor, query, genre)
         self._db_conn.commit()
 
     def _add_subgenre(self, subgenre):
         query = """
             INSERT INTO subgenre (name) VALUES (%s) ON CONFLICT DO NOTHING
             """
+
         with self._db_conn.cursor() as cursor:
-            cursor.execute(query, (subgenre if subgenre else 'None',))
+            execute_batch(cursor, query, subgenre)
         self._db_conn.commit()
 
-    def add_user(self, vk_id, name):
+    def add_user(self, user_data):
+        query = """
+            INSERT INTO vk_user (vk_id, name)
+            VALUES (%s, %s) ON CONFLICT DO NOTHING
+            """
+
         with self._db_conn.cursor() as cursor:
-            query = """
-                INSERT INTO vk_user (vk_id, name)
-                VALUES (%s, %s) ON CONFLICT DO NOTHING
-                """
-            cursor.execute(query, (vk_id, name))
+            execute_batch(cursor, query, user_data)
         self._db_conn.commit()
 
-    def update_user_artists(self, user_vk_id, artists):
-        artists = [x.lower() for x in artists]
-
+    def update_user_artists(self, vk_id, artists):
         cursor = self._db_conn.cursor()
 
         cursor.execute(
-            'SELECT id FROM vk_user WHERE vk_user.vk_id = %s', (user_vk_id,))
-        user_id = cursor.fetchall()[0][0]
+            'SELECT id FROM vk_user WHERE vk_user.vk_id = %s', (vk_id,))
+        db_user_id = cursor.fetchall()[0][0]
 
         # для начала убрать исполнителей, которых пользователь уже удалил
         query = """
-            SELECT artist.name FROM artist
-            WHERE EXISTS (
-                    SELECT artist_id FROM user_to_artist u2a
-                    WHERE u2a.artist_id = artist.id AND user_id = %s
+            DELETE FROM user_to_artist u2a
+            USING artist
+            WHERE user_id = %s AND 
+                u2a.artist_id = artist.id AND
+                artist.name <> ALL(%s)
+            """
+        cursor.execute(query, (db_user_id, list(set(artists))))
+
+        query = """
+            SELECT name FROM artist
+            WHERE name = ANY(%s) AND EXISTS (
+                SELECT 1 FROM user_to_artist u2a
+                WHERE user_id = %s AND u2a.artist_id = artist.id
                 )
             """
-        cursor.execute(query, (user_id,))
-        irrelevant = list(set([x[0] for x in cursor.fetchall()]) - set(artists))
+        cursor.execute(query, (list(set(artists)), db_user_id))
+        existing = set(x[0] for x in cursor.fetchall())
 
-        if irrelevant:
-            # вместо JOIN в DELETE используется USING
+        to_insert = [(db_user_id, a, artists.count(a))
+                     for a in (set(artists) - existing)]
+        if to_insert:
             query = """
-                DELETE FROM user_to_artist
-                USING artist
-                WHERE user_id = %s AND 
-                    user_to_artist.artist_id = artist.id AND
-                    artist.name IN (SELECT * FROM unnest(%s))
+                INSERT INTO user_to_artist(user_id, artist_id, tracks_num)
+                VALUES(
+                    %s,
+                    (SELECT id FROM artist WHERE artist.name = %s),
+                    %s
+                )
                 """
-            cursor.execute(query, (user_id, irrelevant))
+            execute_batch(cursor, query, to_insert)
 
-        for artist in set(artists):
-            # пробуем сначала запись обновить, потому что INSERT ON CONFLICT
-            # работает только с уникальными значениями,
-            # которых в этой таблице нет
+        to_update = [(artists.count(a), db_user_id, a) for a in existing]
+        if to_update:
             query = """
-                UPDATE user_to_artist SET tracks_num = %(tracks_num)s
-                WHERE user_id = %(user_id)s AND
+                UPDATE user_to_artist SET tracks_num = %s
+                WHERE user_id = %s AND
                     EXISTS (
                         SELECT 1 FROM artist
                         WHERE id = user_to_artist.artist_id AND
-                            artist.name = %(artist)s
+                            artist.name = %s
                     )
                 """
-            cursor.execute(query, {
-                'tracks_num': artists.count(artist),
-                'user_id': user_id,
-                'artist': artist
-            })
-
-            # если ничего не обновилось, то записи нет -- создаём
-            if not cursor.rowcount:
-                query = """
-                    INSERT INTO user_to_artist(user_id, artist_id, tracks_num)
-                    VALUES(
-                        %(user_id)s,
-                        (SELECT id FROM artist WHERE artist.name = %(artist)s),
-                        %(tracks_num)s
-                    )
-                    """
-                cursor.execute(query, {
-                    'user_id': user_id,
-                    'artist': artist.lower(),
-                    'tracks_num': artists.count(artist)
-                })
+            execute_batch(cursor, query, to_update)
 
         cursor.close()
         self._db_conn.commit()
 
     def add_genre(self, genre, subgenre):
-        self._add_genre(genre)
-        self._add_subgenre(subgenre)
+        self._add_genre(list(set(genre)))
+        self._add_subgenre(list(set(subgenre)))
 
-    def add_artist(self, name, genre, subgenre):
-        if not genre:
-            subgenre = None
-
-        # TODO: для genre вместо None -- unknown, для sub -- ''
+    def add_artist(self, artists_data):
+        genre = [(d[1],) for d in artists_data if d[1]]
+        subgenre = [(d[2],) for d in artists_data if d[2]]
 
         self.add_genre(genre, subgenre)
 
@@ -300,29 +288,28 @@ class AudioDB:
             """
 
         with self._db_conn.cursor() as cursor:
-            cursor.execute(query, (name.lower(),
-                                   genre if genre else 'None',
-                                   subgenre if subgenre else 'None'))
+            execute_batch(cursor, query, artists_data)
         self._db_conn.commit()
 
     def get_artist_genre(self, artist_name):
         query = """
             SELECT subgenre.name, genre.name FROM artist
-            INNER JOIN genre ON genre.id = artist.genre_id
-            INNER JOIN subgenre ON subgenre.id = artist.subgenre_id
+            LEFT JOIN genre ON genre.id = artist.genre_id
+            LEFT JOIN subgenre ON subgenre.id = artist.subgenre_id
             WHERE artist.name = %s
             """
 
         with self._db_conn.cursor() as cursor:
-            cursor.execute(query, (artist_name.lower(),))
+            cursor.execute(query, (artist_name,))
             resp = cursor.fetchall()
 
         return resp
 
-    def is_artist_exists(self, artist_name):
+    def get_existing(self, artists):
+        query = 'SELECT name FROM artist WHERE artist.name = ANY(%s)'
+
         with self._db_conn.cursor() as cursor:
-            cursor.execute('SELECT name FROM artist WHERE artist.name = %s',
-                           (artist_name.lower(),))
+            cursor.execute(query, (artists,))
             resp = cursor.fetchall()
 
         return resp
@@ -368,8 +355,7 @@ class AudioDB:
                     SELECT id, name FROM subgenre
                 ) AS s ON s.id = a.subid
                 
-                WHERE g.name != 'None' AND
-                    EXISTS (
+                WHERE EXISTS (
                         SELECT 1 FROM vk_user u
                         WHERE u.id = u2a.user_id AND u.vk_id = %s
                     )
@@ -393,7 +379,6 @@ class AudioDB:
                     )
                     GROUP BY artist.genre_id
                 ) AS u_tracks ON u_tracks.gid = genre.id
-                WHERE genre.name != 'None'
                 ORDER BY
                     sum DESC,
                     genre.name ASC
@@ -435,7 +420,6 @@ class AudioDB:
                 GROUP BY artist.genre_id
             ) AS join_user_2 ON join_user_2.a_gid_user_2 = genre.id
             
-            WHERE genre.name != 'None'
             ORDER BY
                 min_sum DESC,
                 genre.name ASC
@@ -455,7 +439,7 @@ class GenreSearcher:
                       'AppleWebKit/537.36 (KHTML, like Gecko) '
                       'Chrome/61.0.3163.100 Safari/537.36'
     }
-    _query_rate = 1  # per second
+    _query_rate = 1
 
     def __init__(self, musicbrainz_credentials):
         self._google_query_prev_time = 0
@@ -465,7 +449,8 @@ class GenreSearcher:
             'token': musicbrainz_credentials['token']
         }
 
-    def _encode(self, string):
+    @staticmethod
+    def _prepare(string):
         return string.replace('#', '%23').replace(' ', r'%20')
 
     def _google(self, artist_name):
@@ -499,7 +484,7 @@ class GenreSearcher:
     def _musicbrainz(self, artist_name):
         # TODO: запрашивать сразу список, из него выбирать
         url = f'https://musicbrainz.org/ws/2/artist/' \
-              f'?query=artist:{self._encode(artist_name)}&inc=tags&fmt=json'
+              f'?query=artist:{self._prepare(artist_name)}&inc=tags&fmt=json'
 
         wait_request_timing(self._musicbrainz_query_prev_time, self._query_rate)
 
@@ -606,7 +591,6 @@ if __name__ == '__main__':
               f'пользователь {user_info["first_name"]} '
               f'{user_info["last_name"]}, id: {user_id}')
 
-        # get audio list
         artists = vk_audio_get.get_audio_list(user_id)
 
         print(f'+{time_diff(start_time)}: {len(artists)} аудиозаписей, '
