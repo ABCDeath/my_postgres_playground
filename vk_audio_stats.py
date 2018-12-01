@@ -1,12 +1,12 @@
 import argparse
 import datetime
-import discogs_client
 import json
 import pickle
-import psycopg2
 import requests
-import vk_requests
 import time
+
+import psycopg2
+import vk_requests
 from bs4 import BeautifulSoup
 
 
@@ -15,7 +15,7 @@ def wait_request_timing(prev_time, rate):
         time.sleep(1 / rate - (time.time() - prev_time))
 
 
-class VkAudioGetter(object):
+class VkAudioGetter:
     def __init__(self, credentials):
         self._query_prev_time = 0
         try:
@@ -76,7 +76,7 @@ class VkAudioGetter(object):
             # (например, 50) или равен количеству ранее выданных аудиозаписей,
             # поэтому запоминаем, на чем остановились.
             container_start = 0
-            if last_audio is not None:
+            if last_audio:
                 for num, item in enumerate(
                         container[0].find_all('span', 'ai_title')):
                     if item.string == last_audio:
@@ -91,7 +91,7 @@ class VkAudioGetter(object):
             offset += len(content)
 
 
-class AudioDB(object):
+class AudioDB:
     def __init__(self, user, password):
         self._db_conn = psycopg2.connect(
             host='localhost', port='5432', user=user, password=password,
@@ -408,7 +408,7 @@ class AudioDB(object):
 
         return resp
 
-class GenreSearcher(object):
+class GenreSearcher:
     _USER_AGENT = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                       'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -426,14 +426,6 @@ class GenreSearcher(object):
 
     def _encode(self, string):
         return string.replace('#', '%23').replace(' ', r'%20')
-
-    def _discogs(self, artist_name):
-        client = discogs_client.Client(
-            'MyGetArtistGenreApp/0.1',
-            user_token='bgXSArBadKChVYdHHRnfylRtPmXLZfUDZyRQKjzB')
-        res = client.search(artist_name, type='artist')
-        # нет жанров/тегов/стилей у исполнителя, только по релизам
-        pass
 
     def _google(self, artist_name):
         # TODO: попробовать вместо гугла какой-нибудь duckduckgo
