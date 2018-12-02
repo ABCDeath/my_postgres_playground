@@ -20,10 +20,9 @@ import requests
 import time
 
 import aiohttp
-import psycopg2
+import asyncpg
 import vk_requests
 from bs4 import BeautifulSoup
-from psycopg2.extras import execute_batch
 
 
 def wait_request_timing(prev_time, rate):
@@ -116,8 +115,9 @@ class VkAudioGetter:
             last_audio = titles[-1]
             content = container[0].find_all('span', 'ai_artist')
 
-            queue.put_nowait(
-                [a.string.lower() for a in content[container_start:]])
+            queue.put_nowait((
+                user_id,
+                [a.string.lower() for a in content[container_start:]]))
 
             offset += len(content)
 
@@ -127,13 +127,13 @@ class VkAudioGetter:
 
         logging.info('закончили получать список аудио')
 
-        finish.set()
-        queue.put_nowait(None)
-
 
 class AudioDB:
-    def __init__(self, user, password):
-        self._db_conn = psycopg2.connect(
+    def __init__(self):
+        self._db_conn = None
+
+    async def open(self, user, password):
+        self._db_conn = await asyncpg.connect(
             host='localhost', port='5432', user=user, password=password,
             database='music')
 
@@ -179,99 +179,94 @@ class AudioDB:
             """
         )
 
-        with self._db_conn.cursor() as cursor:
+        async with self._db_conn.transaction():
             for item in query:
-                cursor.execute(item)
+                await self._db_conn.execute(item)
 
-        self._db_conn.commit()
+    async def close(self):
+        await self._db_conn.close()
 
-    def _add_genre(self, genre):
-        query = 'INSERT INTO genre (name) VALUES (%s) ON CONFLICT DO NOTHING'
+    async def _add_genre(self, genre):
+        query = 'INSERT INTO genre (name) VALUES ($1) ON CONFLICT DO NOTHING'
 
-        with self._db_conn.cursor() as cursor:
-            execute_batch(cursor, query, genre)
-        self._db_conn.commit()
+        async with self._db_conn.transaction():
+            await self._db_conn.executemany(query, genre)
 
-    def _add_subgenre(self, subgenre):
+    async def _add_subgenre(self, subgenre):
         query = """
-            INSERT INTO subgenre (name) VALUES (%s) ON CONFLICT DO NOTHING
+            INSERT INTO subgenre (name) VALUES ($1) ON CONFLICT DO NOTHING
             """
 
-        with self._db_conn.cursor() as cursor:
-            execute_batch(cursor, query, subgenre)
-        self._db_conn.commit()
+        async with self._db_conn.transaction():
+            await self._db_conn.executemany(query, subgenre)
 
-    def add_user(self, user_data):
+    async def add_user(self, user_data):
         query = """
             INSERT INTO vk_user (vk_id, name)
-            VALUES (%s, %s) ON CONFLICT DO NOTHING
+            VALUES ($1, $2) ON CONFLICT DO NOTHING
             """
 
-        with self._db_conn.cursor() as cursor:
-            execute_batch(cursor, query, user_data)
-        self._db_conn.commit()
+        async with self._db_conn.transaction():
+            await self._db_conn.executemany(query, user_data)
 
-    def update_user_artists(self, vk_id, artists):
-        cursor = self._db_conn.cursor()
+    async def update_user_artists(self, vk_id, artists):
+        async with self._db_conn.transaction():
+            await self._db_conn.execute(
+                'SELECT id FROM vk_user WHERE vk_user.vk_id = $1', (vk_id,))
+            db_user_id = await self._db_conn.fetchrow()[0]
 
-        cursor.execute(
-            'SELECT id FROM vk_user WHERE vk_user.vk_id = %s', (vk_id,))
-        db_user_id = cursor.fetchall()[0][0]
-
-        # для начала убрать исполнителей, которых пользователь уже удалил
-        query = """
-            DELETE FROM user_to_artist u2a
-            USING artist
-            WHERE user_id = %s AND 
-                u2a.artist_id = artist.id AND
-                artist.name <> ALL(%s)
-            """
-        cursor.execute(query, (db_user_id, list(set(artists))))
-
-        query = """
-            SELECT name FROM artist
-            WHERE name = ANY(%s) AND EXISTS (
-                SELECT 1 FROM user_to_artist u2a
-                WHERE user_id = %s AND u2a.artist_id = artist.id
-                )
-            """
-        cursor.execute(query, (list(set(artists)), db_user_id))
-        existing = set(x[0] for x in cursor.fetchall())
-
-        to_insert = [(db_user_id, a, artists.count(a))
-                     for a in (set(artists) - existing)]
-        if to_insert:
+            # для начала убрать исполнителей, которых пользователь уже удалил
             query = """
-                INSERT INTO user_to_artist(user_id, artist_id, tracks_num)
-                VALUES(
-                    %s,
-                    (SELECT id FROM artist WHERE artist.name = %s),
-                    %s
-                )
+                DELETE FROM user_to_artist u2a
+                USING artist
+                WHERE user_id = %s AND 
+                    u2a.artist_id = artist.id AND
+                    artist.name <> ALL(%s)
                 """
-            execute_batch(cursor, query, to_insert)
+            await self._db_conn.execute(query, (db_user_id, list(set(artists))))
 
-        to_update = [(artists.count(a), db_user_id, a) for a in existing]
-        if to_update:
             query = """
-                UPDATE user_to_artist SET tracks_num = %s
-                WHERE user_id = %s AND
-                    EXISTS (
-                        SELECT 1 FROM artist
-                        WHERE id = user_to_artist.artist_id AND
-                            artist.name = %s
+                SELECT name FROM artist
+                WHERE name = ANY(%s) AND EXISTS (
+                    SELECT 1 FROM user_to_artist u2a
+                    WHERE user_id = %s AND u2a.artist_id = artist.id
                     )
                 """
-            execute_batch(cursor, query, to_update)
+            await self._db_conn.execute(query, (list(set(artists)), db_user_id))
+            res = await self._db_conn.fetch()
+            existing = set(x[0] for x in res)
 
-        cursor.close()
-        self._db_conn.commit()
+            to_insert = [(db_user_id, a, artists.count(a))
+                         for a in (set(artists) - existing)]
+            if to_insert:
+                query = """
+                    INSERT INTO user_to_artist(user_id, artist_id, tracks_num)
+                    VALUES(
+                        %s,
+                        (SELECT id FROM artist WHERE artist.name = %s),
+                        %s
+                    )
+                    """
+                await self._db_conn.executemany(query, to_insert)
+
+            to_update = [(artists.count(a), db_user_id, a) for a in existing]
+            if to_update:
+                query = """
+                    UPDATE user_to_artist SET tracks_num = %s
+                    WHERE user_id = %s AND
+                        EXISTS (
+                            SELECT 1 FROM artist
+                            WHERE id = user_to_artist.artist_id AND
+                                artist.name = %s
+                        )
+                    """
+                await self._db_conn.executemany(query, to_update)
 
     def add_genre(self, genre, subgenre):
         self._add_genre(list(set(genre)))
         self._add_subgenre(list(set(subgenre)))
 
-    def add_artist(self, artists_data):
+    async def add_artist(self, artists_data):
         genre = [(d[1],) for d in artists_data if d[1]]
         subgenre = [(d[2],) for d in artists_data if d[2]]
 
@@ -287,11 +282,10 @@ class AudioDB:
             ON CONFLICT DO NOTHING
             """
 
-        with self._db_conn.cursor() as cursor:
-            execute_batch(cursor, query, artists_data)
-        self._db_conn.commit()
+        async with self._db_conn.transaction():
+            await self._db_conn.executemany(query, artists_data)
 
-    def get_artist_genre(self, artist_name):
+    async def get_artist_genre(self, artist_name):
         query = """
             SELECT subgenre.name, genre.name FROM artist
             LEFT JOIN genre ON genre.id = artist.genre_id
@@ -299,22 +293,16 @@ class AudioDB:
             WHERE artist.name = %s
             """
 
-        with self._db_conn.cursor() as cursor:
-            cursor.execute(query, (artist_name,))
-            resp = cursor.fetchall()
+        await self._db_conn.execute(query, (artist_name,))
+        return await self._db_conn.fetch()
 
-        return resp
-
-    def get_existing(self, artists):
+    async def get_existing(self, artists):
         query = 'SELECT name FROM artist WHERE artist.name = ANY(%s)'
 
-        with self._db_conn.cursor() as cursor:
-            cursor.execute(query, (artists,))
-            resp = cursor.fetchall()
+        await self._db_conn.execute(query, (artists,))
+        return await self._db_conn.fetch()
 
-        return resp
-
-    def get_user_artists(self, vk_id, limit=None):
+    async def get_user_artists(self, vk_id, limit=None):
         query = """
             SELECT artist.name, u2a.tracks_num FROM artist
             INNER JOIN (
@@ -332,13 +320,10 @@ class AudioDB:
             LIMIT %s
             """
 
-        with self._db_conn.cursor() as cursor:
-            cursor.execute(query, (vk_id, limit))
-            resp = cursor.fetchall()
+        await self._db_conn.execute(query, (vk_id, limit))
+        return await self._db_conn.fetch()
 
-        return resp
-
-    def get_user_genres(self, vk_id, sub=False, limit=None):
+    async def get_user_genres(self, vk_id, sub=False, limit=None):
         if sub:
             query = """
                 SELECT s.name, g.name, SUM(tracks_num) FROM user_to_artist u2a
@@ -385,13 +370,10 @@ class AudioDB:
                 LIMIT %s
                 """
 
-        with self._db_conn.cursor() as cursor:
-            cursor.execute(query, (vk_id, limit))
-            resp = cursor.fetchall()
+        await self._db_conn.execute(query, (vk_id, limit))
+        return await self._db_conn.fetch()
 
-        return resp
-
-    def users_genre_intersection(self, vk_id_user_1, vk_id_user_2, limit=None):
+    async def users_genre_intersection(self, vk_id_user_1, vk_id_user_2, limit=None):
         query = """
             SELECT genre.name,
                 LEAST(sum_user_1, sum_user_2) AS min_sum FROM genre
@@ -426,11 +408,8 @@ class AudioDB:
             LIMIT %s
             """
 
-        with self._db_conn.cursor() as cursor:
-            cursor.execute(query, (vk_id_user_1, vk_id_user_2, limit))
-            resp = cursor.fetchall()
-
-        return resp
+        await self._db_conn.execute(query, (vk_id_user_1, vk_id_user_2, limit))
+        return await self._db_conn.fetch()
 
 
 class GenreSearcher:
@@ -454,7 +433,6 @@ class GenreSearcher:
         return string.replace('#', '%23').replace(' ', r'%20')
 
     def _google(self, artist_name):
-        # TODO: попробовать вместо гугла какой-нибудь duckduckgo
         query = ''.join([artist_name, ' genre']).replace(' ', '+')
 
         wait_request_timing(self._google_query_prev_time, self._query_rate)
@@ -518,32 +496,112 @@ def time_diff(start_time):
     return str(datetime.datetime.now() - start_time)
 
 
-async def get_audio(vk_id, queue, finish, credentials):
+async def vk_get_audio(vk_id, queue, credentials):
     vk_audio_getter = VkAudioGetter()
     await vk_audio_getter.open(credentials)
 
     for id in vk_id:
-        await vk_audio_getter.get_audio_list(id, queue, finish)
+        await vk_audio_getter.get_audio_list(id, queue)
 
     await vk_audio_getter.close()
+    queue.put_nowait(None)
 
 
-async def dummy(q, event):
-    while not q.empty() or not event.is_set():
-        print(await q.get())
-        q.task_done()
+class dbTasks:
+    def __init__(self, vk_artists_queue, to_search, from_search):
+        self._db = AudioDB()
+        self._vk_artists_queue = vk_artists_queue
+        self._to_search = to_search
+        self._from_search = from_search
+        self._artists_to_update = asyncio.Queue()
+        self._update_event = asyncio.Event()
 
-    logging.info('обработали все аудио')
+    async def open(self, credentials):
+        await self._db.open(credentials['user'], credentials['password'])
+
+    async def close(self):
+        await self._db.close()
+
+    async def get_existing(self):
+        while True:
+            logging.info('ждём данных из вк в очереди')
+
+            new_part = await self._vk_artists_queue.get()
+            self._vk_artists_queue.task_done()
+
+            if not new_part:
+                logging.info('данных нет, завершение задачи')
+                break
+
+            self._artists_to_update.put_nowait(new_part)
+
+            new_part = new_part[1]
+
+            existing = await self._db.get_existing(set(new_part))
+            need_search = set(new_part) - set(existing)
+
+            logging.info(f'нужно найти теги для {len(need_search)} '
+                         f'исполнителей из {len(set(new_part))} '
+                         f'({len(new_part)} всего)')
+
+            if need_search:
+                self._to_search.put_nowate(need_search)
+            else:
+                self._update_event.set()
+
+        self._to_search.put_nowate([])
+
+    async def update_artist(self):
+        while True:
+            logging.info('ждём данных в очереди с тегами')
+
+            new_part = await self._from_search.get()
+            self._from_search.task_done()
+
+            if not new_part:
+                logging.info('данных нет, завершение задачи')
+                break
+
+            logging.info(f'добавляем {len(new_part)} исполнителей с тегами')
+
+            await self._db.add_artist(new_part)
+
+            self._update_event.set()
+
+    async def update_user(self):
+        while True:
+            logging.info('ждём event')
+            await self._update_event.wait()
+
+            logging.info('достаём пользователя и исполнителей из очередей')
+
+            new_part = await self._artists_to_update.get()
+
+            if not new_part:
+                logging.info('обновлять нечего, завершение задачи')
+                break
+
+            user_id = new_part[0]
+            user = api.users.get(user_ids=int(user_id), lang=0)[0]
+            name = ' '.join([user['first_name'], user['last_name']])
+
+            logging.info(f'добавляем пользователя {user_id}: {name}')
+
+            await self._db.add_user(([user_id, name],))
+
+            new_part = new_part[1]
+
+            logging.info(f'добавляем {len(new_part)} исполнителей к {user_id}')
+
+            await self._db.update_user_artists(user_id, new_part)
 
 
 def run_tasks(vk_id, credentials):
     loop = asyncio.get_event_loop()
     vk_audio_queue = asyncio.Queue()
-    vk_audio_event = asyncio.Event()
 
     loop.run_until_complete(asyncio.gather(
-            get_audio(vk_id, vk_audio_queue, vk_audio_event, credentials['vk']),
-            dummy(vk_audio_queue, vk_audio_event)
+            vk_get_audio(vk_id, vk_audio_queue, credentials['vk']),
         ))
     loop.close()
 
