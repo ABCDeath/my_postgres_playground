@@ -202,7 +202,7 @@ class AudioDB:
                 )
             """
         cursor.execute(query, (list(set(artists)), db_user_id))
-        res = self._db_conn.fetchall()
+        res = cursor.fetchall()
         existing = set(x[0] for x in res)
 
         to_insert = [(db_user_id, a, artists.count(a))
@@ -218,7 +218,8 @@ class AudioDB:
                 """
             execute_batch(cursor, query, to_insert)
 
-        to_update = [(artists.count(a), db_user_id, a) for a in existing]
+        to_update = [(artists.count(a), db_user_id, a)
+                     for a in existing if a in artists]
         if to_update:
             query = """
                 UPDATE user_to_artist SET tracks_num = %s
@@ -272,11 +273,11 @@ class AudioDB:
 
         return resp
 
-    def get_existing(self, artists):
+    def get_existing_artists(self, artists):
         query = 'SELECT name FROM artist WHERE artist.name = ANY(%s)'
 
         with self._db_conn.cursor() as cursor:
-            cursor.execute(query, artists)
+            cursor.execute(query, (artists,))
             resp = cursor.fetchall()
 
         return resp
@@ -511,39 +512,35 @@ if __name__ == '__main__':
 
     del credentials
 
-    print(f'+{time_diff(start_time)}: получение аудиозаписей.')
+    user_info = api.users.get(user_ids=[int(u) for u in args.ids], lang=0)
+    db.add_user([(u['id'], ' '.join([u['first_name'], u['last_name']]))
+                 for u in user_info])
+
+    logging.info(f'получение аудиозаписей.')
+
+    for user in user_info:
+        logging.info(f'пользователь {user["first_name"]} {user["last_name"]}, '
+              f'id: {user["id"]}')
+
+        artists = vk_audio_get.user_audio_list(user['id'])
+
+        logging.info(f'{len(artists)} аудиозаписей, '
+                     f'поиск и добавление тегов в бд')
+
+        existing = [a[0] for a in db.get_existing_artists(list(set(artists)))]
+
+        to_add = [(a, *search.search(a)) for a in set(artists)-set(existing)]
+        db.add_artist(to_add)
+
+        logging.info(f'добавление исполнителей')
+
+        db.update_user_artists(str(user['id']), artists)
+
+    logging.info('закончили добавлять информацию')
 
     for user_id in args.ids:
-        user_info = api.users.get(user_ids=int(user_id), lang=0)[0]
+        print(f'{user_id}:', db.get_user_artists(user_id, 5))
+        print(f'{user_id}:', db.get_user_genres(user_id, True, 5))
 
-        db.add_user(user_id, ' '.join(
-            [user_info['first_name'], user_info['last_name']]))
-
-        print(f'+{time_diff(start_time)}: '
-              f'пользователь {user_info["first_name"]} '
-              f'{user_info["last_name"]}, id: {user_id}')
-
-        artists = vk_audio_get.get_audio_list(user_id)
-
-        print(f'+{time_diff(start_time)}: {len(artists)} аудиозаписей, '
-              f'поиск и добавление тегов в бд')
-
-        for artist in artists:
-            if db.is_artist_exists(artist):
-                continue
-
-            genre, subgenre = search.search(artist)
-            db.add_artist(artist, genre, subgenre)
-
-        print(f'+{time_diff(start_time)}: добавление исполнителей')
-
-        db.update_user_artists(user_id, artists)
-
-    for user_id in args.ids:
-        print(f'+{time_diff(start_time)}: {user_id}:',
-              db.get_user_artists(user_id, 5))
-        print(f'+{time_diff(start_time)}: {user_id}:',
-              db.get_user_genres(user_id, True, 5))
-
-    print(f'+{time_diff(start_time)}: {args.ids[0]} - {args.ids[1]}:',
+    print(f'{args.ids[0]} - {args.ids[1]}:',
           db.users_genre_intersection(args.ids[0], args.ids[1], 5))
